@@ -22,7 +22,7 @@ jobs:
 
       - name: Install apt-utils
         run: |
-          apt-get update && apt-get install -y --no-install-recommends apt-utils
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils
 
       - name: Build And Deploy
         id: builddeploy
