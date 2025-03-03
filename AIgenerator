@@ -1,0 +1,2002 @@
+%%capture
+!pip install -q diffusers==0.27.2 transformers accelerate einops controlnet_aux compel safetensors ipywidgets huggingface_hub xformers
+!jupyter nbextension enable --py widgetsnbextension
+
+import os
+import torch
+import random
+import gc
+import json
+import numpy as np
+import base64
+from datetime import datetime
+from PIL import Image, ImageEnhance, ImageFilter
+from io import BytesIO
+from IPython.display import display, clear_output, HTML
+import ipywidgets as widgets
+from diffusers import (
+    StableDiffusionXLPipeline,
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionControlNetPipeline,
+    ControlNetModel,
+    DiffusionPipeline,
+    AutoencoderKL
+)
+from diffusers.utils import make_image_grid
+from diffusers.schedulers import (
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    EulerDiscreteScheduler,
+    EulerAncestralDiscreteScheduler,
+    HeunDiscreteScheduler,
+    KDPM2DiscreteScheduler,
+    UniPCMultistepScheduler
+)
+from compel import Compel
+from transformers import AutoProcessor, CLIPVisionModelWithProjection
+from huggingface_hub import HfApi
+
+# --- Constants ---
+DEFAULT_MODELS = [
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    "stabilityai/sdxl-turbo",
+    "runwayml/stable-diffusion-v1-5",
+    "stabilityai/stable-diffusion-2-1",
+    "emilianJR/epiCRealism",
+    "SG161222/Realistic_Vision_V5.1",
+    "timbrooks/instruct-pix2pix",
+]
+
+CONTROLNET_MODELS = [
+    "lllyasviel/control_v11p_sd15_canny",
+    "lllyasviel/control_v11p_sd15_openpose",
+    "lllyasviel/control_v11f_sd15_depth",
+    "lllyasviel/sd-controlnet-scribble",
+    "lllyasviel/control_v11p_sd15_softedge",
+    "lllyasviel/control_v11p_sd15_seg",
+    "patrickvonplaten/controlnet-canny-sdxl-1.0"
+]
+
+SCHEDULERS = {
+    "DPM++ 2M Karras": lambda config: DPMSolverMultistepScheduler.from_config(config, use_karras_sigmas=True, algorithm_type="dpmsolver++"),
+    "DPM++ 2M": lambda config: DPMSolverMultistepScheduler.from_config(config),
+    "Euler A": lambda config: EulerAncestralDiscreteScheduler.from_config(config),
+    "Euler": lambda config: EulerDiscreteScheduler.from_config(config),
+    "DDIM": lambda config: DDIMScheduler.from_config(config),
+    "Heun": lambda config: HeunDiscreteScheduler.from_config(config),
+    "KDPM2": lambda config: KDPM2DiscreteScheduler.from_config(config),
+    "UniPC": lambda config: UniPCMultistepScheduler.from_config(config)
+}
+
+PROMPT_TEMPLATES = {
+    "Portrait": "portrait of {}, high detail, photorealistic, 8k, hyper-detailed",
+    "Landscape": "landscape of {}, golden hour, 8k, cinematic, professional photography",
+    "Fantasy": "fantasy {}, digital painting, concept art, detailed, trending on artstation",
+    "Anime": "anime {}, vibrant colors, studio ghibli style, high quality illustration",
+    "Realistic": "{} photorealistic, sharp focus, 8k uhd, dslr, detailed, lifelike"
+}
+
+class PipelineManager:
+    """Central manager for all diffusion pipelines and models."""
+
+    def __init__(self):
+        self.txt2img_pipe = None
+        self.img2img_pipe = None
+        self.controlnet_pipe = None
+        self.current_model_id = None
+        self.vae = None
+        self.controlnet = None
+        self.ip_adapter = None
+        self.compel_proc = None
+
+    def load_pipeline(self, model_id, scheduler_name="DPM++ 2M Karras", use_xformers=True, enable_cpu_offload=True):
+        """Load the main text-to-image pipeline."""
+        if model_id == self.current_model_id and self.txt2img_pipe is not None:
+            # Only update scheduler if model is already loaded
+            self._update_scheduler(scheduler_name)
+            return
+
+        # Clear GPU memory before loading new models
+        self._clear_memory()
+
+        try:
+            # Determine if SDXL model based on model_id
+            is_sdxl = "xl" in model_id.lower() or "sdxl" in model_id.lower()
+
+            # Special case for Pix2Pix
+            if "pix2pix" in model_id.lower():
+                self.txt2img_pipe = DiffusionPipeline.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float16,
+                    safety_checker=None
+                ).to("cuda")
+            else:
+                # Standard loading path
+                pipeline_class = StableDiffusionXLPipeline if is_sdxl else DiffusionPipeline
+                self.txt2img_pipe = pipeline_class.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True,
+                    variant="fp16",
+                    safety_checker=None
+                ).to("cuda")
+
+            # Set scheduler
+            self._update_scheduler(scheduler_name)
+
+            # Apply optimizations
+            if use_xformers and hasattr(self.txt2img_pipe, "enable_xformers_memory_efficient_attention"):
+                self.txt2img_pipe.enable_xformers_memory_efficient_attention()
+
+            if enable_cpu_offload:
+                self.txt2img_pipe.enable_model_cpu_offload()
+
+            # Set up compel processor for better prompt weighting
+            if is_sdxl:
+                self.compel_proc = Compel(
+                    tokenizer=[self.txt2img_pipe.tokenizer, self.txt2img_pipe.tokenizer_2],
+                    text_encoder=[self.txt2img_pipe.text_encoder, self.txt2img_pipe.text_encoder_2],
+                    returned_embeddings_type="penultimate_hidden_states_normalized",
+                    requires_pooled=[False, True]
+                )
+            else:
+                self.compel_proc = Compel(tokenizer=self.txt2img_pipe.tokenizer, text_encoder=self.txt2img_pipe.text_encoder)
+
+            self.current_model_id = model_id
+
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            raise
+
+    def load_img2img_pipeline(self):
+        """Initialize image-to-image pipeline based on current model."""
+        if self.txt2img_pipe is None:
+            return None
+
+        if self.img2img_pipe is None:
+            # Share parameters with text-to-image pipeline
+            is_sdxl = "xl" in self.current_model_id.lower() or "sdxl" in self.current_model_id.lower()
+
+            if hasattr(self.txt2img_pipe, "to_img2img"):
+                # Some models have direct conversion methods
+                self.img2img_pipe = self.txt2img_pipe.to_img2img()
+            else:
+                # Fall back to standard approach
+                self.img2img_pipe = StableDiffusionImg2ImgPipeline(
+                    vae=self.txt2img_pipe.vae,
+                    text_encoder=self.txt2img_pipe.text_encoder,
+                    tokenizer=self.txt2img_pipe.tokenizer,
+                    unet=self.txt2img_pipe.unet,
+                    scheduler=self.txt2img_pipe.scheduler,
+                    safety_checker=None,
+                    feature_extractor=None,
+                    requires_safety_checker=False
+                ).to("cuda")
+
+                # For SDXL models, set additional components
+                if is_sdxl and hasattr(self.txt2img_pipe, "text_encoder_2"):
+                    self.img2img_pipe.text_encoder_2 = self.txt2img_pipe.text_encoder_2
+                    self.img2img_pipe.tokenizer_2 = self.txt2img_pipe.tokenizer_2
+
+        return self.img2img_pipe
+
+    def load_controlnet(self, controlnet_model_id):
+        """Load a ControlNet model."""
+        try:
+            self.controlnet = ControlNetModel.from_pretrained(
+                controlnet_model_id,
+                torch_dtype=torch.float16
+            ).to("cuda")
+
+            if self.txt2img_pipe is not None:
+                self.controlnet_pipe = StableDiffusionControlNetPipeline(
+                    vae=self.txt2img_pipe.vae,
+                    text_encoder=self.txt2img_pipe.text_encoder,
+                    tokenizer=self.txt2img_pipe.tokenizer,
+                    unet=self.txt2img_pipe.unet,
+                    scheduler=self.txt2img_pipe.scheduler,
+                    safety_checker=None,
+                    feature_extractor=None,
+                    controlnet=self.controlnet
+                ).to("cuda")
+
+                # Apply optimizations
+                if hasattr(self.controlnet_pipe, "enable_xformers_memory_efficient_attention"):
+                    self.controlnet_pipe.enable_xformers_memory_efficient_attention()
+
+                self.controlnet_pipe.enable_model_cpu_offload()
+
+            return True
+        except Exception as e:
+            print(f"Error loading ControlNet: {str(e)}")
+            return False
+
+    def _clear_memory(self):
+        """Clear GPU memory by deleting pipelines and running garbage collection."""
+        if self.txt2img_pipe is not None:
+            del self.txt2img_pipe
+        if self.img2img_pipe is not None:
+            del self.img2img_pipe
+        if self.controlnet_pipe is not None:
+            del self.controlnet_pipe
+        if self.controlnet is not None:
+            del self.controlnet
+        if self.vae is not None:
+            del self.vae
+
+        self.txt2img_pipe = None
+        self.img2img_pipe = None
+        self.controlnet_pipe = None
+        self.controlnet = None
+        self.vae = None
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def _update_scheduler(self, scheduler_name):
+        """Update the scheduler for the pipeline."""
+        if self.txt2img_pipe is None or scheduler_name not in SCHEDULERS:
+            return
+
+        scheduler_config = self.txt2img_pipe.scheduler.config
+        self.txt2img_pipe.scheduler = SCHEDULERS[scheduler_name](scheduler_config)
+
+        if self.img2img_pipe is not None:
+            self.img2img_pipe.scheduler = SCHEDULERS[scheduler_name](scheduler_config)
+
+        if self.controlnet_pipe is not None:
+            self.controlnet_pipe.scheduler = SCHEDULERS[scheduler_name](scheduler_config)
+
+    def get_prompt_embeds(self, prompt, negative_prompt=""):
+        """Get prompt embeddings using Compel for better prompt weighting."""
+        if self.compel_proc is None:
+            return None, None
+
+        try:
+            is_sdxl = "xl" in self.current_model_id.lower() or "sdxl" in self.current_model_id.lower()
+
+            if is_sdxl:
+                prompt_embeds, pooled = self.compel_proc([prompt])
+                neg_prompt_embeds, neg_pooled = self.compel_proc([negative_prompt] if negative_prompt else [""])
+                return prompt_embeds, neg_prompt_embeds, pooled, neg_pooled
+            else:
+                prompt_embeds = self.compel_proc([prompt])
+                neg_prompt_embeds = self.compel_proc([negative_prompt] if negative_prompt else [""])
+                return prompt_embeds, neg_prompt_embeds
+        except Exception as e:
+            print(f"Error processing prompts: {str(e)}")
+            return None, None
+
+class ImageProcessor:
+    """Handles image processing tasks."""
+
+    @staticmethod
+    def resize_for_condition_image(input_image, resolution=512):
+        """Resize image for conditioning."""
+        input_image = input_image.convert("RGB")
+        W, H = input_image.size
+        k = min(resolution / W, resolution / H)
+        W *= k
+        H *= k
+        W, H = int(round(W)), int(round(H))
+        img = input_image.resize((W, H), Image.LANCZOS)
+        return img
+
+    @staticmethod
+    def prepare_controlnet_image(image, processor_type):
+        """Process image for ControlNet based on different types."""
+        try:
+            from controlnet_aux import (
+                CannyDetector, OpenposeDetector,
+                MidasDetector, PidiNetDetector,
+                HEDdetector, LineartDetector,
+                NormalBaeDetector, MLSDdetector
+            )
+
+            # Resize image to appropriate size
+            image = ImageProcessor.resize_for_condition_image(image)
+
+            if "canny" in processor_type:
+                canny = CannyDetector()
+                control_image = canny(image, low_threshold=100, high_threshold=200)
+            elif "openpose" in processor_type:
+                openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+                control_image = openpose(image)
+            elif "depth" in processor_type:
+                midas = MidasDetector.from_pretrained("lllyasviel/ControlNet")
+                control_image = midas(image)
+            elif "scribble" in processor_type:
+                pidinet = PidiNetDetector.from_pretrained("lllyasviel/ControlNet")
+                control_image = pidinet(image)
+            elif "softedge" in processor_type:
+                hed = HEDdetector.from_pretrained("lllyasviel/ControlNet")
+                control_image = hed(image)
+            elif "lineart" in processor_type:
+                lineart = LineartDetector.from_pretrained("lllyasviel/ControlNet")
+                control_image = lineart(image)
+            else:
+                # Default fallback
+                control_image = image
+
+            return control_image
+        except Exception as e:
+            print(f"Error in ControlNet processing: {str(e)}")
+            return image
+
+    @staticmethod
+    def apply_image_adjustment(image, brightness=1.0, contrast=1.0, saturation=1.0, sharpness=1.0):
+        """Apply image adjustments."""
+        if brightness != 1.0:
+            image = ImageEnhance.Brightness(image).enhance(brightness)
+        if contrast != 1.0:
+            image = ImageEnhance.Contrast(image).enhance(contrast)if saturation != 1.0:
+            image = ImageEnhance.Color(image).enhance(saturation)
+        if sharpness != 1.0:
+            image = ImageEnhance.Sharpness(image).enhance(sharpness)
+        return image
+
+    @staticmethod
+    def save_image(image, filename=None, directory="generated_images"):
+        """Save image to file."""
+        # Create directory if it doesn't exist
+        os.makedirs(directory, exist_ok=True)
+
+        # Generate filename if not provided
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"image_{timestamp}.png"
+
+        # Ensure filename has extension
+        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            filename = f"{filename}.png"
+
+        # Save the image
+        filepath = os.path.join(directory, filename)
+        image.save(filepath)
+
+        return filepath
+
+    @staticmethod
+    def image_to_base64(image):
+        """Convert PIL image to base64 string."""
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return img_str
+
+    @staticmethod
+    def create_image_grid(images, rows=None, cols=None):
+        """Create a grid of images."""
+        if not images:
+            return None
+
+        # Determine grid dimensions if not specified
+        if rows is None and cols is None:
+            # Default to square grid
+            cols = int(np.ceil(np.sqrt(len(images))))
+            rows = int(np.ceil(len(images) / cols))
+        elif rows is None:
+            rows = int(np.ceil(len(images) / cols))
+        elif cols is None:
+            cols = int(np.ceil(len(images) / rows))
+
+        # Use diffusers utility for grid creation
+        try:
+            grid = make_image_grid(images, rows=rows, cols=cols)
+            return grid
+        except:
+            # Fallback to manual grid creation
+            width, height = images[0].size
+            grid_width = width * cols
+            grid_height = height * rows
+            grid_img = Image.new('RGB', (grid_width, grid_height))
+
+            for i, img in enumerate(images):
+                row = i // cols
+                col = i % cols
+                grid_img.paste(img, (col * width, row * height))
+
+            return grid_img
+
+
+class ImageGenerationSession:
+    """Manages a session of image generation, including history and metadata."""
+
+    def __init__(self):
+        self.history = []
+        self.current_index = -1
+        self.metadata = {}
+
+    def add_image(self, image, params):
+        """Add generated image and its parameters to history."""
+        entry = {
+            "image": image,
+            "params": params,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        # If we're not at the end of history, truncate it
+        if self.current_index < len(self.history) - 1:
+            self.history = self.history[:self.current_index + 1]
+
+        self.history.append(entry)
+        self.current_index = len(self.history) - 1
+        return self.current_index
+
+    def get_current_image(self):
+        """Get the current image in history."""
+        if not self.history or self.current_index < 0:
+            return None
+        return self.history[self.current_index]["image"]
+
+    def get_current_params(self):
+        """Get parameters for the current image."""
+        if not self.history or self.current_index < 0:
+            return {}
+        return self.history[self.current_index]["params"]
+
+    def move_to_previous(self):
+        """Move to previous image in history."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            return True
+        return False
+
+    def move_to_next(self):
+        """Move to next image in history."""
+        if self.current_index < len(self.history) - 1:
+            self.current_index += 1
+            return True
+        return False
+
+    def save_session(self, filename="sd_session.json"):
+        """Save session data to file."""
+        session_data = {
+            "metadata": self.metadata,
+            "history": []
+        }
+
+        # Convert images to base64 for storage
+        for entry in self.history:
+            img_base64 = ImageProcessor.image_to_base64(entry["image"])
+            history_entry = {
+                "image_base64": img_base64,
+                "params": entry["params"],
+                "timestamp": entry["timestamp"]
+            }
+            session_data["history"].append(history_entry)
+
+        with open(filename, 'w') as f:
+            json.dump(session_data, f)
+
+        return filename
+
+    def load_session(self, filename="sd_session.json"):
+        """Load session data from file."""
+        try:
+            with open(filename, 'r') as f:
+                session_data = json.load(f)
+
+            self.metadata = session_data.get("metadata", {})
+            self.history = []
+
+            # Convert base64 back to images
+            for entry in session_data.get("history", []):
+                img_base64 = entry.get("image_base64", "")
+                img_data = base64.b64decode(img_base64)
+                image = Image.open(BytesIO(img_data))
+
+                self.history.append({
+                    "image": image,
+                    "params": entry.get("params", {}),
+                    "timestamp": entry.get("timestamp", datetime.now().isoformat())
+                })
+
+            self.current_index = len(self.history) - 1 if self.history else -1
+            return True
+        except Exception as e:
+            print(f"Error loading session: {str(e)}")
+            return False
+
+
+class AdvancedUI:
+    """Advanced UI for Stable Diffusion with multiple tabs and features."""
+
+    def __init__(self):
+        self.pipeline_manager = PipelineManager()
+        self.session = ImageGenerationSession()
+
+        # Tab state tracking
+        self.current_tab = 0
+
+        # Initialize UI components
+        self.initialize_ui()
+
+    def initialize_ui(self):
+        """Initialize all UI components."""
+        # Create tab components
+        self.create_txt2img_tab()
+        self.create_img2img_tab()
+        self.create_controlnet_tab()
+        self.create_settings_tab()
+
+        # Create common components
+        self.create_image_display()
+        self.create_status_bar()
+
+        # Layout components
+        self.create_layout()
+
+    def create_txt2img_tab(self):
+        """Create text-to-image tab components."""
+        # Model selection
+        self.model_dropdown = widgets.Dropdown(
+            options=DEFAULT_MODELS,
+            value=DEFAULT_MODELS[0],
+            description='Model:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+
+        # Prompt inputs
+        self.prompt_input = widgets.Textarea(
+            placeholder="Enter prompt here. Use (word) for emphasis or [word] for de-emphasis...",
+            layout={'width': 'auto', 'height': '80px'}
+        )
+
+        # Prompt templates
+        self.template_dropdown = widgets.Dropdown(
+            options=list(PROMPT_TEMPLATES.keys()),
+            value="Realistic",
+            description='Template:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+        self.apply_template_btn = widgets.Button(
+            description="Apply Template",
+            button_style='info',
+            tooltip='Apply selected template to current prompt'
+        )
+        self.apply_template_btn.on_click(self.apply_template)
+
+        # Negative prompt
+        self.negative_prompt_input = widgets.Textarea(
+            placeholder="Enter negative prompt here...",
+            layout={'width': 'auto', 'height': '60px'}
+        )
+
+        # Generation parameters
+        self.width_dropdown = widgets.Dropdown(
+            options=[512, 576, 640, 704, 768, 832, 896, 960, 1024],
+            value=512,
+            description='Width:',
+            style={'description_width': 'initial'}
+        )
+        self.height_dropdown = widgets.Dropdown(
+            options=[512, 576, 640, 704, 768, 832, 896, 960, 1024],
+            value=512,
+            description='Height:',
+            style={'description_width': 'initial'}
+        )
+
+        self.steps_slider = widgets.IntSlider(
+            min=1, max=150, step=1, value=30,
+            description='Steps:',
+            style={'description_width': 'initial'}
+        )
+
+        self.cfg_slider = widgets.FloatSlider(
+            min=1.0, max=20.0, step=0.5, value=7.5,
+            description='CFG Scale:',
+            style={'description_width': 'initial'}
+        )
+
+        self.batch_size_slider = widgets.IntSlider(
+            min=1, max=4, step=1, value=1,
+            description='Batch Size:',
+            style={'description_width': 'initial'}
+        )
+
+        # Scheduler selection
+        self.scheduler_dropdown = widgets.Dropdown(
+            options=list(SCHEDULERS.keys()),
+            value="DPM++ 2M Karras",
+            description='Scheduler:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+
+        # Seed control
+        self.seed_input = widgets.IntText(
+            value=-1,
+            description='Seed:',
+            style={'description_width': 'initial'}
+        )
+        self.random_seed_check = widgets.Checkbox(
+            value=True,
+            description='Random Seed',
+            indent=False
+        )
+
+        # Generate button
+        self.generate_btn = widgets.Button(
+            description="Generate Image",
+            button_style='success',
+            tooltip='Generate image from prompt',
+            icon='play'
+        )
+        self.generate_btn.on_click(self.generate_txt2img)
+
+        # Create tab layout
+        self.txt2img_tab = widgets.VBox([
+            widgets.HTML("<h2>Text to Image</h2>"),
+            self.model_dropdown,
+            widgets.HBox([self.template_dropdown, self.apply_template_btn]),
+            widgets.HTML("<b>Prompt:</b>"),
+            self.prompt_input,
+            widgets.HTML("<b>Negative Prompt:</b>"),
+            self.negative_prompt_input,
+            widgets.HBox([self.width_dropdown, self.height_dropdown]),
+            widgets.HBox([self.steps_slider, self.cfg_slider]),
+            widgets.HBox([self.batch_size_slider, self.scheduler_dropdown]),
+            widgets.HBox([self.seed_input, self.random_seed_check]),
+            self.generate_btn
+        ])
+
+    def create_img2img_tab(self):
+        """Create image-to-image tab components."""
+        # Upload widget
+        self.img2img_upload = widgets.FileUpload(
+            accept='image/*',
+            multiple=False,
+            description='Upload Image:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+        self.img2img_upload.observe(self.handle_img2img_upload, names='value')
+
+        # Current image display
+        self.img2img_preview = widgets.Output()
+
+        # Image-to-image specific controls
+        self.prompt_strength_slider = widgets.FloatSlider(
+            min=0.0, max=1.0, step=0.05, value=0.8,
+            description='Prompt Strength:',
+            style={'description_width': 'initial'}
+        )
+
+        # Use same prompt controls as txt2img but with different callback
+        self.img2img_prompt = widgets.Textarea(
+            placeholder="Enter prompt here. Use (word) for emphasis or [word] for de-emphasis...",
+            layout={'width': 'auto', 'height': '80px'}
+        )
+
+        self.img2img_negative_prompt = widgets.Textarea(
+            placeholder="Enter negative prompt here...",
+            layout={'width': 'auto', 'height': '60px'}
+        )
+
+        # Image preprocessing controls
+        self.img2img_resize_dropdown = widgets.Dropdown(
+            options=['Keep Original', '512×512', '768×768', '1024×1024'],
+            value='Keep Original',
+            description='Resize:',
+            style={'description_width': 'initial'}
+        )
+
+        # Image adjustment sliders
+        self.brightness_slider = widgets.FloatSlider(
+            min=0.5, max=1.5, step=0.1, value=1.0,
+            description='Brightness:',
+            style={'description_width': 'initial'}
+        )
+        self.contrast_slider = widgets.FloatSlider(
+            min=0.5, max=1.5, step=0.1, value=1.0,
+            description='Contrast:',
+            style={'description_width': 'initial'}
+        )
+
+        # Generate button
+        self.generate_img2img_btn = widgets.Button(
+            description="Generate Variation",
+            button_style='success',
+            tooltip='Generate image based on input image',
+            icon='random',
+            disabled=True
+        )
+        self.generate_img2img_btn.on_click(self.generate_img2img)
+
+        # Reset button
+        self.reset_img2img_btn = widgets.Button(
+            description="Reset",
+            button_style='warning',
+            tooltip='Reset image and parameters',
+            icon='refresh',
+            disabled=True
+        )
+        self.reset_img2img_btn.on_click(self.reset_img2img)
+
+        # Create tab layout
+        self.img2img_tab = widgets.VBox([
+            widgets.HTML("<h2>Image to Image</h2>"),
+            self.img2img_upload,
+            self.img2img_preview,
+            widgets.HTML("<b>Prompt:</b>"),
+            self.img2img_prompt,
+            widgets.HTML("<b>Negative Prompt:</b>"),
+            self.img2img_negative_prompt,
+            widgets.HBox([self.img2img_resize_dropdown, self.prompt_strength_slider]),
+            widgets.HBox([self.brightness_slider, self.contrast_slider]),
+            widgets.HBox([self.generate_img2img_btn, self.reset_img2img_btn])
+        ])
+
+    def create_controlnet_tab(self):
+        """Create ControlNet tab components."""
+        # ControlNet model selection
+        self.controlnet_model_dropdown = widgets.Dropdown(
+            options=CONTROLNET_MODELS,
+            value=CONTROLNET_MODELS[0],
+            description='ControlNet:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+
+        # Upload widget for control image
+        self.controlnet_upload = widgets.FileUpload(
+            accept='image/*',
+            multiple=False,
+            description='Upload Control Image:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+        self.controlnet_upload.observe(self.handle_controlnet_upload, names='value')
+
+        # Control image display
+        self.controlnet# Control image display
+        self.controlnet_preview = widgets.Output()
+
+        # ControlNet specific parameters
+        self.controlnet_conditioning_scale = widgets.FloatSlider(
+            min=0.0, max=2.0, step=0.05, value=1.0,
+            description='Conditioning Scale:',
+            style={'description_width': 'initial'}
+        )
+
+        self.controlnet_detection_resolution = widgets.IntSlider(
+            min=128, max=1024, step=64, value=512,
+            description='Detection Resolution:',
+            style={'description_width': 'initial'}
+        )
+
+        # Preprocessor controls
+        self.controlnet_preprocessor_dropdown = widgets.Dropdown(
+            options=['None', 'Canny Edge', 'Depth Map', 'OpenPose', 'Segmentation'],
+            value='None',
+            description='Preprocessor:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+
+        self.preprocessor_btn = widgets.Button(
+            description="Apply Preprocessor",
+            button_style='info',
+            tooltip='Apply preprocessor to control image',
+            disabled=True
+        )
+        self.preprocessor_btn.on_click(self.apply_preprocessor)
+
+        # Generate button
+        self.generate_controlnet_btn = widgets.Button(
+            description="Generate with ControlNet",
+            button_style='success',
+            tooltip='Generate image using ControlNet guidance',
+            icon='magic',
+            disabled=True
+        )
+        self.generate_controlnet_btn.on_click(self.generate_controlnet)
+
+        # Create tab layout
+        self.controlnet_tab = widgets.VBox([
+            widgets.HTML("<h2>ControlNet</h2>"),
+            self.controlnet_model_dropdown,
+            self.controlnet_upload,
+            self.controlnet_preview,
+            widgets.HBox([self.controlnet_preprocessor_dropdown, self.preprocessor_btn]),
+            widgets.HBox([self.controlnet_conditioning_scale, self.controlnet_detection_resolution]),
+            widgets.HTML("<b>Prompt:</b>"),
+            self.prompt_input,  # Reuse from txt2img tab
+            widgets.HTML("<b>Negative Prompt:</b>"),
+            self.negative_prompt_input,  # Reuse from txt2img tab
+            self.generate_controlnet_btn
+        ])
+
+    def create_settings_tab(self):
+        """Create settings tab with configuration options."""
+        # Memory management settings
+        self.offload_models_check = widgets.Checkbox(
+            value=True,
+            description='Offload Models When Not In Use',
+            indent=False
+        )
+
+        self.enable_xformers_check = widgets.Checkbox(
+            value=True,
+            description='Enable xFormers Memory Efficient Attention',
+            indent=False
+        )
+
+        # VRAM optimization settings
+        self.vram_optimization_dropdown = widgets.Dropdown(
+            options=['Balanced', 'Speed Priority', 'VRAM Efficiency'],
+            value='Balanced',
+            description='VRAM Optimization:',
+            style={'description_width': 'initial'}
+        )
+
+        # Model management
+        self.download_model_input = widgets.Text(
+            placeholder="Enter model ID or URL",
+            description='Download Model:',
+            style={'description_width': 'initial'},
+            layout={'width': 'auto'}
+        )
+
+        self.download_model_btn = widgets.Button(
+            description="Download",
+            button_style='info',
+            tooltip='Download model from Hugging Face'
+        )
+        self.download_model_btn.on_click(self.download_model)
+
+        # Session management
+        self.save_session_btn = widgets.Button(
+            description="Save Session",
+            button_style='info',
+            tooltip='Save current session to file'
+        )
+        self.save_session_btn.on_click(self.save_session)
+
+        self.load_session_btn = widgets.Button(
+            description="Load Session",
+            button_style='info',
+            tooltip='Load session from file'
+        )
+        self.load_session_btn.on_click(self.load_session)
+
+        # Create tab layout
+        self.settings_tab = widgets.VBox([
+            widgets.HTML("<h2>Settings</h2>"),
+            widgets.HTML("<h3>Performance</h3>"),
+            self.offload_models_check,
+            self.enable_xformers_check,
+            self.vram_optimization_dropdown,
+            widgets.HTML("<h3>Model Management</h3>"),
+            widgets.HBox([self.download_model_input, self.download_model_btn]),
+            widgets.HTML("<h3>Session Management</h3>"),
+            widgets.HBox([self.save_session_btn, self.load_session_btn])
+        ])
+
+    def create_image_display(self):
+        """Create components for displaying generated images."""
+        # Image output
+        self.output_display = widgets.Output()
+
+        # Image controls
+        self.save_btn = widgets.Button(
+            description="Save Image",
+            button_style='info',
+            tooltip='Save current image to file',
+            icon='save',
+            disabled=True
+        )
+        self.save_btn.on_click(self.save_current_image)
+
+        self.prev_btn = widgets.Button(
+            description="Previous",
+            button_style='info',
+            tooltip='View previous image',
+            icon='arrow-left',
+            disabled=True
+        )
+        self.prev_btn.on_click(self.show_previous_image)
+
+        self.next_btn = widgets.Button(
+            description="Next",
+            button_style='info',
+            tooltip='View next image',
+            icon='arrow-right',
+            disabled=True
+        )
+        self.next_btn.on_click(self.show_next_image)
+
+        # Create image info display
+        self.image_info = widgets.HTML("No image generated")
+
+        # Layout for image display and controls
+        self.image_controls = widgets.HBox([self.prev_btn, self.save_btn, self.next_btn])
+        self.image_display = widgets.VBox([
+            self.output_display,
+            self.image_controls,
+            self.image_info
+        ])
+
+    def create_status_bar(self):
+        """Create status bar with progress indicators."""
+        # Progress bar
+        self.progress_bar = widgets.FloatProgress(
+            value=0,
+            min=0,
+            max=1.0,
+            description='Progress:',
+            bar_style='info',
+            style={'description_width': 'initial'}
+        )
+
+        # Status message
+        self.status_message = widgets.HTML("Ready")
+
+        # Cancel button
+        self.cancel_btn = widgets.Button(
+            description="Cancel",
+            button_style='danger',
+            tooltip='Cancel current operation',
+            icon='stop',
+            disabled=True
+        )
+        self.cancel_btn.on_click(self.cancel_operation)
+
+        # Create status bar layout
+        self.status_bar = widgets.HBox([
+            self.progress_bar,
+            self.status_message,
+            self.cancel_btn
+        ])
+
+    def create_layout(self):
+        """Create the complete UI layout."""
+        # Create tabs for different modes
+        self.tabs = widgets.Tab(children=[
+            self.txt2img_tab,
+            self.img2img_tab,
+            self.controlnet_tab,
+            self.settings_tab
+        ])
+        self.tabs.set_title(0, 'Text to Image')
+        self.tabs.set_title(1, 'Image to Image')
+        self.tabs.set_title(2, 'ControlNet')
+        self.tabs.set_title(3, 'Settings')
+        self.tabs.observe(self.handle_tab_change, names='selected_index')
+
+        # Main UI layout
+        self.main_layout = widgets.VBox([
+            widgets.HTML("<h1>Stable Diffusion Studio</h1>"),
+            widgets.HBox([
+                widgets.VBox([self.tabs], layout={'width': '50%'}),
+                widgets.VBox([self.image_display], layout={'width': '50%'})
+            ]),
+            self.status_bar
+        ])
+
+    def display(self):
+        """Display the UI."""
+        display(self.main_layout)
+
+    # Event handlers
+    def handle_tab_change(self, change):
+        """Handle tab selection change."""
+        self.current_tab = change['new']
+
+        # Load appropriate model for the selected tab
+        if self.current_tab == 0:  # Text to image
+            self.load_txt2img_model()
+        elif self.current_tab == 1:  # Image to image
+            self.load_img2img_model()
+        elif self.current_tab == 2:  # ControlNet
+            self.load_controlnet_model()
+
+    def apply_template(self, btn):
+        """Apply selected prompt template."""
+        template_name = self.template_dropdown.value
+        template = PROMPT_TEMPLATES.get(template_name, "")
+
+        current_prompt = self.prompt_input.value.strip()
+        if current_prompt:
+            # Append template to existing prompt
+            self.prompt_input.value = f"{current_prompt}, {template}"
+        else:
+            # Use template as prompt
+            self.prompt_input.value = template
+
+    def handle_img2img_upload(self, change):
+        """Handle image upload for img2img."""
+        if not change['new']:
+            return
+
+        # Get uploaded file data
+        uploaded_file = list(change['new'].values())[0]
+        content = uploaded_file['content']
+
+        # Convert to PIL Image
+        image = Image.open(BytesIO(content))
+
+        # Store the image
+        self.img2img_source_image = image
+
+        # Display the image
+        with self.img2img_preview:
+            self.img2img_preview.clear_output(wait=True)
+            display(image)
+
+        # Enable buttons
+        self.generate_img2img_btn.disabled = False
+        self.reset_img2img_btn.disabled = False
+
+    def handle_controlnet_upload(self, change):
+        """Handle image upload for ControlNet."""
+        if not change['new']:
+            return
+
+        # Get uploaded file data
+        uploaded_file = list(change['new'].values())[0]
+        content = uploaded_file['content']
+
+        # Convert to PIL Image
+        image = Image.open(BytesIO(content))
+
+        # Store the image
+        self.controlnet_source_image = image
+
+        # Display the image
+        with self.controlnet_preview:
+            self.controlnet_preview.clear_output(wait=True)
+            display(image)
+
+        # Enable buttons
+        self.preprocessor_btn.disabled = False
+        self.generate_controlnet_btn.disabled = False
+
+    # Model loading methods
+    def load_txt2img_model(self):
+        """Load model for text-to-image."""
+        model_id = self.model_dropdown.value
+        self.update_status(f"Loading {model_id}...")
+
+        try:
+            self.pipeline_manager.load_txt2img_pipeline(
+                model_id,
+                enable_xformers=self.enable_xformers_check.value
+            )
+            self.update_status("Model loaded successfully")
+        except Exception as e:
+            self.update_status(f"Error loading model: {str(e)}")
+
+    def load_img2img_model(self):
+        """Load model for image-to-image."""
+        model_id = self.model_dropdown.value
+        self.update_status(f"Loading {model_id} for img2img...")
+
+        try:
+            self.pipeline_manager.load_img2img_pipeline(
+                model_id,
+                enable_xformers=self.enable_xformers_check.value
+            )
+            self.update_status("Model loaded successfully")
+        except Exception as e:
+            self.update_status(f"Error loading model: {str(e)}")
+
+    def load_controlnet_model(self):
+        """Load model for ControlNet."""
+        model_id = self.model_dropdown.value
+        controlnet_id = self.controlnet_model_dropdown.value
+        self.update_status(f"Loading {model_id} with {controlnet_id}...")
+
+        try:
+            self.pipeline_manager.load_controlnet_pipeline(
+                model_id,
+                controlnet_id,
+                enable_xformers=self.enable_xformers_check.value
+            )
+            self.update_status("ControlNet model loaded successfully")
+        except Exception as e:
+            self.update_status(f"Error loading ControlNet model: {str(e)}")
+
+    # Generation methods
+    def generate_txt2img(self, btn):
+        """Generate image from text prompt."""
+        self.update_status("Generating image from text...")
+        self.progress_bar.value = 0
+        self.cancel_btn.disabled = False
+
+        # Get generation parameters
+        prompt = self.prompt_input.value
+        negative_prompt = self.negative_prompt_input.value
+        width = self.width_dropdown.value
+        height = self.height_dropdown.value
+        steps = self.steps_slider.value
+        cfg_scale = self.cfg_slider.value
+        batch_size = self.batch_size_slider.value
+        scheduler_name = self.scheduler_dropdown.value
+        seed = self.seed_input.value if not self.random_seed_check.value else random.randint(0, 2147483647)
+
+        # Store seed for reproducibility
+        self.seed_input.value = seed
+
+        # Get scheduler
+        scheduler_class = SCHEDULERS.get(scheduler_name)
+
+        try:
+            # Generate image
+            images = self.pipeline_manager.generate_txt2img(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=cfg_scale,
+                num_images_per_prompt=batch_size,
+                scheduler=scheduler_class,
+                seed=seed,
+                callback=self.generation_callback
+            )
+
+            # Add to session history
+            params = {
+                "type": "txt2img",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "cfg_scale": cfg_scale,
+                "scheduler": scheduler_name,
+                "seed": seed,
+                "model": self.model_dropdown.value
+            }
+
+            if batch_size > 1:
+                # Create grid
+                grid = ImageProcessor.create_image_grid(images, cols=2)
+                self.session.add_image(grid, params)
+                self.display_current_image()
+            else:
+                # Add single image
+                self.session.add_image(images[0], params)
+                self.display_current_image()
+
+            self.update_status("Image generated successfully")
+            self.save_btn.disabled = False
+            self.prev_btn.disabled = len(self.session.history) > 1
+            self.next_btn.disabled = True
+
+        except Exception as e:
+            self.update_status(f"Error generating image: {str(e)}")
+        finally:
+            self.cancel_btn.disabled = True
+            self.progress_bar.value = 0
+
+    def generate_img2img(self, btn):
+        """Generate image from input image."""
+        self.update_status("Generating image from input image...")
+        self.progress_bar.value = 0
+        self.cancel_btn.disabled = False
+
+        # Get generation# Get generation parameters
+        prompt = self.img2img_prompt.value
+        negative_prompt = self.img2img_negative_prompt.value
+        steps = self.steps_slider.value
+        cfg_scale = self.cfg_slider.value
+        scheduler_name = self.scheduler_dropdown.value
+        seed = self.seed_input.value if not self.random_seed_check.value else random.randint(0, 2147483647)
+        strength = self.prompt_strength_slider.value
+
+        # Store seed for reproducibility
+        self.seed_input.value = seed
+
+        # Preprocess the input image
+        image = self.img2img_source_image
+
+        # Apply image adjustments
+        brightness = self.brightness_slider.value
+        contrast = self.contrast_slider.value
+        if brightness != 1.0 or contrast != 1.0:
+            image = ImageProcessor.adjust_image(
+                image,
+                brightness=brightness,
+                contrast=contrast
+            )
+
+        # Resize image if needed
+        resize_option = self.img2img_resize_dropdown.value
+        if resize_option != 'Keep Original':
+            size = int(resize_option.split('×')[0])
+            image = image.resize((size, size), Image.LANCZOS)
+
+        # Get scheduler
+        scheduler_class = SCHEDULERS.get(scheduler_name)
+
+        try:
+            # Generate image
+            images = self.pipeline_manager.generate_img2img(
+                prompt=prompt,
+                image=image,
+                negative_prompt=negative_prompt,
+                strength=strength,
+                num_inference_steps=steps,
+                guidance_scale=cfg_scale,
+                scheduler=scheduler_class,
+                seed=seed,
+                callback=self.generation_callback
+            )
+
+            # Add to session history
+            params = {
+                "type": "img2img",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "strength": strength,
+                "steps": steps,
+                "cfg_scale": cfg_scale,
+                "scheduler": scheduler_name,
+                "seed": seed,
+                "model": self.model_dropdown.value
+            }
+
+            # Add single image to history
+            self.session.add_image(images[0], params)
+            self.display_current_image()
+
+            self.update_status("Image generated successfully")
+            self.save_btn.disabled = False
+            self.prev_btn.disabled = len(self.session.history) > 1
+            self.next_btn.disabled = True
+
+        except Exception as e:
+            self.update_status(f"Error generating image: {str(e)}")
+        finally:
+            self.cancel_btn.disabled = True
+            self.progress_bar.value = 0
+
+    def generate_controlnet(self, btn):
+        """Generate image using ControlNet guidance."""
+        self.update_status("Generating image with ControlNet...")
+        self.progress_bar.value = 0
+        self.cancel_btn.disabled = False
+
+        # Get generation parameters
+        prompt = self.prompt_input.value
+        negative_prompt = self.negative_prompt_input.value
+        steps = self.steps_slider.value
+        cfg_scale = self.cfg_slider.value
+        scheduler_name = self.scheduler_dropdown.value
+        seed = self.seed_input.value if not self.random_seed_check.value else random.randint(0, 2147483647)
+        conditioning_scale = self.controlnet_conditioning_scale.value
+
+        # Store seed for reproducibility
+        self.seed_input.value = seed
+
+        # Get conditioning image
+        control_image = self.controlnet_source_image
+
+        # Get scheduler
+        scheduler_class = SCHEDULERS.get(scheduler_name)
+
+        try:
+            # Generate image
+            images = self.pipeline_manager.generate_controlnet(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                control_image=control_image,
+                conditioning_scale=conditioning_scale,
+                num_inference_steps=steps,
+                guidance_scale=cfg_scale,
+                scheduler=scheduler_class,
+                seed=seed,
+                callback=self.generation_callback
+            )
+
+            # Add to session history
+            params = {
+                "type": "controlnet",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "controlnet_model": self.controlnet_model_dropdown.value,
+                "conditioning_scale": conditioning_scale,
+                "steps": steps,
+                "cfg_scale": cfg_scale,
+                "scheduler": scheduler_name,
+                "seed": seed,
+                "model": self.model_dropdown.value
+            }
+
+            # Add image to history
+            self.session.add_image(images[0], params)
+            self.display_current_image()
+
+            self.update_status("Image generated successfully")
+            self.save_btn.disabled = False
+            self.prev_btn.disabled = len(self.session.history) > 1
+            self.next_btn.disabled = True
+
+        except Exception as e:
+            self.update_status(f"Error generating image: {str(e)}")
+        finally:
+            self.cancel_btn.disabled = True
+            self.progress_bar.value = 0
+
+    def apply_preprocessor(self, btn):
+        """Apply preprocessor to ControlNet image."""
+        if not hasattr(self, 'controlnet_source_image'):
+            return
+
+        preprocessor = self.controlnet_preprocessor_dropdown.value
+        if preprocessor == 'None':
+            return
+
+        self.update_status(f"Applying {preprocessor} preprocessor...")
+
+        try:
+            # Apply selected preprocessor
+            if preprocessor == 'Canny Edge':
+                from cv2 import Canny, cvtColor, COLOR_RGB2GRAY
+                import numpy as np
+
+                # Convert PIL to numpy array
+                img_array = np.array(self.controlnet_source_image)
+                # Convert to grayscale
+                img_gray = cvtColor(img_array, COLOR_RGB2GRAY)
+                # Apply Canny edge detection
+                edges = Canny(img_gray, 100, 200)
+                # Convert back to RGB
+                processed_img = np.stack((edges,)*3, axis=-1)
+                processed_image = Image.fromarray(processed_img)
+
+            elif preprocessor == 'Depth Map':
+                from transformers import DPTImageProcessor, DPTForDepthEstimation
+                import torch
+                import numpy as np
+
+                # Load depth estimation model
+                processor = DPTImageProcessor.from_pretrained("Intel/dpt-large")
+                model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large")
+
+                # Process image
+                inputs = processor(images=self.controlnet_source_image, return_tensors="pt")
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                    predicted_depth = outputs.predicted_depth
+
+                # Interpolate to original size
+                prediction = torch.nn.functional.interpolate(
+                    predicted_depth.unsqueeze(1),
+                    size=self.controlnet_source_image.size[::-1],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze()
+
+                # Normalize depth map
+                depth_map = (prediction - prediction.min()) / (prediction.max() - prediction.min())
+                depth_map = (depth_map * 255).cpu().numpy().astype(np.uint8)
+                processed_image = Image.fromarray(depth_map).convert("RGB")
+
+            elif preprocessor == 'OpenPose':
+                # For simplicity, we'll use a placeholder for OpenPose
+                # In a real implementation, you would integrate a pose estimation model
+                self.update_status("OpenPose preprocessing requires additional dependencies")
+                return
+
+            elif preprocessor == 'Segmentation':
+                from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+                import torch
+                import numpy as np
+
+                # Load segmentation model
+                processor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+                model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+
+                # Process image
+                inputs = processor(images=self.controlnet_source_image, return_tensors="pt")
+                with torch.no_grad():
+                    outputs = model(**inputs)
+
+                # Get segmentation map
+                logits = outputs.logits
+                seg_map = logits.argmax(dim=1)[0]
+
+                # Create colorful segmentation map
+                colors = np.random.randint(0, 255, size=(150, 3), dtype=np.uint8)
+                seg_map_np = seg_map.cpu().numpy()
+                colored_seg_map = colors[seg_map_np]
+                processed_image = Image.fromarray(colored_seg_map)
+
+            # Update the control image
+            self.controlnet_source_image = processed_image
+
+            # Display processed image
+            with self.controlnet_preview:
+                self.controlnet_preview.clear_output(wait=True)
+                display(processed_image)
+
+            self.update_status(f"{preprocessor} applied successfully")
+
+        except Exception as e:
+            self.update_status(f"Error applying preprocessor: {str(e)}")
+
+    # Display and navigation methods
+    def display_current_image(self):
+        """Display the current image in history."""
+        image = self.session.get_current_image()
+        if image is None:
+            return
+
+        # Display image
+        with self.output_display:
+            self.output_display.clear_output(wait=True)
+            display(image)
+
+        # Update image info with parameters
+        params = self.session.get_current_params()
+        if params:
+            # Format parameters as HTML
+            info_html = f"<b>Image {self.session.current_index + 1}/{len(self.session.history)}</b><br>"
+            info_html += f"<b>Type:</b> {params.get('type', 'Unknown')}<br>"
+            info_html += f"<b>Model:</b> {params.get('model', 'Unknown')}<br>"
+            info_html += f"<b>Seed:</b> {params.get('seed', 'Unknown')}<br>"
+
+            if 'prompt' in params:
+                # Truncate long prompts
+                prompt = params['prompt']
+                if len(prompt) > 100:
+                    prompt = prompt[:100] + "..."
+                info_html += f"<b>Prompt:</b> {prompt}<br>"
+
+            self.image_info.value = info_html
+
+        # Update navigation buttons
+        self.prev_btn.disabled = self.session.current_index <= 0
+        self.next_btn.disabled = self.session.current_index >= len(self.session.history) - 1
+        self.save_btn.disabled = False
+
+    def show_previous_image(self, btn):
+        """Show the previous image in history."""
+        if self.session.move_to_previous():
+            self.display_current_image()
+
+    def show_next_image(self, btn):
+        """Show the next image in history."""
+        if self.session.move_to_next():
+            self.display_current_image()
+
+    def save_current_image(self, btn):
+        """Save the current image to file."""
+        image = self.session.get_current_image()
+        if image is None:
+            return
+
+        # Get parameters for filename
+        params = self.session.get_current_params()
+        seed = params.get('seed', 'unknown')
+        model_name = params.get('model', '').split('/')[-1]
+
+        # Create filename
+        filename = f"{model_name}_{seed}"
+
+        try:
+            # Save image
+            filepath = ImageProcessor.save_image(image, filename)
+            self.update_status(f"Image saved as {filepath}")
+        except Exception as e:
+            self.update_status(f"Error saving image: {str(e)}")
+
+    # Session management methods
+    def save_session(self, btn):
+        """Save current session to file."""
+        try:
+            filename = self.session.save_session()
+            self.update_status(f"Session saved as {filename}")
+        except Exception as e:
+            self.update_status(f"Error saving session: {str(e)}")
+
+    def load_session(self, btn):
+        """Load session from file."""
+        try:
+            success = self.session.load_session()
+            if success:
+                self.display_current_image()
+                self.update_status("Session loaded successfully")
+            else:
+                self.update_status("Failed to load session")
+        except Exception as e:
+            self.update_status(f"Error loading session: {str(e)}")
+
+    def reset_img2img(self, btn):
+        """Reset img2img inputs and image."""
+        # Clear image
+        if hasattr(self, 'img2img_source_image'):
+            delattr(self, 'img2img_source_image')
+
+        # Clear preview
+        with self.img2img_preview:
+            self.img2img_preview.clear_output()
+
+        # Reset sliders
+        self.brightness_slider.value = 1.0
+        self.contrast_slider.value = 1.0
+        self.prompt_strength_slider.value = 0.8
+
+        # Reset prompts
+        self.img2img_prompt.value = ""
+        self.img2img_negative_prompt.value = ""
+
+        # Disable buttons
+        self.generate_img2img_btn.disabled = True
+        self.reset_img2img_btn.disabled = True
+
+        self.update_status("Image-to-image reset")
+
+    # Utility methods
+    def download_model(self, btn):
+        """Download model from Hugging Face."""
+        model_id = self.download_model_input.value.strip()
+        if not model_id:
+            self.update_status("Please enter a valid model ID")
+            return
+
+        self.update_status(f"Downloading model {model_id}...")
+
+        try:
+            # Download model
+            from diffusers import StableDiffusionPipeline
+
+            # Just download the model, don't load it
+            StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16,
+                use_safetensors=True
+            )
+
+            self.update_status(f"Model {model_id} downloaded successfully")
+
+            # Add to model dropdown if not already present
+            if model_id not in self.model_dropdown.options:
+                self.model_dropdown.options = list(self.model_dropdown.options) + [model_id]
+
+        except Exception as e:
+            self.update_status(f"Error downloading model: {str(e)}")
+
+    def generation_callback(self, step, timestep, latents):
+        """Callback for generation progress updates."""
+        total_steps = self.steps_slider.value
+        progress = step / total_steps
+        self.progress_bar.value = progress
+        self.status_message.value = f"Generating: Step {step}/{total_steps}"
+        return True  # Continue generation
+
+    def cancel_operation(self, btn):
+        """Cancel current operation."""
+        # Set flag to cancel generation
+        self.pipeline_manager.cancel_generation = True
+        self.update_status("Operation cancelled")
+        self.cancel_btn.disabled = True
+
+    def update_status(self, message):
+        """Update status message."""
+        self.status_message.value = message
+        # For debugging
+        print(message)
+
+
+class PipelineManager:
+    """Manages different Stable Diffusion pipelines and their configuration."""
+
+    def __init__(self):
+        self.txtclass PipelineManager:
+    """Manages different Stable Diffusion pipelines and their configuration."""
+
+    def __init__(self):
+        self.txt2img_pipeline = None
+        self.img2img_pipeline = None
+        self.controlnet_pipeline = None
+        self.current_model_id = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.cancel_generation = False
+
+    def load_model(self, model_id):
+        """Load a Stable Diffusion model."""
+        if model_id == self.current_model_id and self.txt2img_pipeline is not None:
+            return True
+
+        try:
+            # Unload existing models to free memory
+            self._unload_pipelines()
+
+            # Load text-to-image pipeline
+            self.txt2img_pipeline = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                use_safetensors=True
+            )
+            self.txt2img_pipeline.to(self.device)
+
+            # Enable attention slicing to reduce memory usage
+            if hasattr(self.txt2img_pipeline, "enable_attention_slicing"):
+                self.txt2img_pipeline.enable_attention_slicing()
+
+            self.current_model_id = model_id
+            return True
+
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            return False
+
+    def _unload_pipelines(self):
+        """Unload all pipelines to free memory."""
+        if self.txt2img_pipeline is not None:
+            del self.txt2img_pipeline
+            self.txt2img_pipeline = None
+
+        if self.img2img_pipeline is not None:
+            del self.img2img_pipeline
+            self.img2img_pipeline = None
+
+        if self.controlnet_pipeline is not None:
+            del self.controlnet_pipeline
+            self.controlnet_pipeline = None
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
+    def generate_txt2img(self, prompt, negative_prompt="", height=512, width=512,
+                        num_inference_steps=50, guidance_scale=7.5,
+                        scheduler=None, seed=None, callback=None):
+        """Generate image from text prompt."""
+        if self.txt2img_pipeline is None:
+            raise ValueError("Model not loaded")
+
+        # Reset cancellation flag
+        self.cancel_generation = False
+
+        # Set random seed
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(self.device).manual_seed(seed)
+
+        # Configure scheduler if specified
+        if scheduler is not None:
+            self.txt2img_pipeline.scheduler = scheduler.from_config(
+                self.txt2img_pipeline.scheduler.config
+            )
+
+        # Generate image
+        result = self.txt2img_pipeline(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            callback=callback,
+            callback_steps=1
+        )
+
+        return result.images
+
+    def generate_img2img(self, prompt, image, negative_prompt="", strength=0.8,
+                        num_inference_steps=50, guidance_scale=7.5,
+                        scheduler=None, seed=None, callback=None):
+        """Generate image from image and text prompt."""
+        if self.txt2img_pipeline is None:
+            raise ValueError("Model not loaded")
+
+        # Reset cancellation flag
+        self.cancel_generation = False
+
+        # Load img2img pipeline if needed
+        if self.img2img_pipeline is None:
+            self.img2img_pipeline = StableDiffusionImg2ImgPipeline(
+                vae=self.txt2img_pipeline.vae,
+                text_encoder=self.txt2img_pipeline.text_encoder,
+                tokenizer=self.txt2img_pipeline.tokenizer,
+                unet=self.txt2img_pipeline.unet,
+                scheduler=self.txt2img_pipeline.scheduler,
+                safety_checker=self.txt2img_pipeline.safety_checker,
+                feature_extractor=self.txt2img_pipeline.feature_extractor
+            )
+            self.img2img_pipeline.to(self.device)
+
+            # Enable attention slicing to reduce memory usage
+            if hasattr(self.img2img_pipeline, "enable_attention_slicing"):
+                self.img2img_pipeline.enable_attention_slicing()
+
+        # Set random seed
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(self.device).manual_seed(seed)
+
+        # Configure scheduler if specified
+        if scheduler is not None:
+            self.img2img_pipeline.scheduler = scheduler.from_config(
+                self.img2img_pipeline.scheduler.config
+            )
+
+        # Generate image
+        result = self.img2img_pipeline(
+            prompt=prompt,
+            image=image,
+            negative_prompt=negative_prompt,
+            strength=strength,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            callback=callback,
+            callback_steps=1
+        )
+
+        return result.images
+
+    def generate_controlnet(self, prompt, control_image, negative_prompt="",
+                           conditioning_scale=1.0, num_inference_steps=50,
+                           guidance_scale=7.5, scheduler=None, seed=None,
+                           callback=None):
+        """Generate image using ControlNet guidance."""
+        if self.txt2img_pipeline is None:
+            raise ValueError("Model not loaded")
+
+        # Reset cancellation flag
+        self.cancel_generation = False
+
+        # Load controlnet pipeline if needed
+        if self.controlnet_pipeline is None:
+            # Import needed for controlnet
+            from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
+
+            # Load controlnet model
+            controlnet_model = ControlNetModel.from_pretrained(
+                "lllyasviel/sd-controlnet-canny",
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            )
+
+            # Create controlnet pipeline
+            self.controlnet_pipeline = StableDiffusionControlNetPipeline(
+                vae=self.txt2img_pipeline.vae,
+                text_encoder=self.txt2img_pipeline.text_encoder,
+                tokenizer=self.txt2img_pipeline.tokenizer,
+                unet=self.txt2img_pipeline.unet,
+                scheduler=self.txt2img_pipeline.scheduler,
+                safety_checker=self.txt2img_pipeline.safety_checker,
+                feature_extractor=self.txt2img_pipeline.feature_extractor,
+                controlnet=controlnet_model
+            )
+            self.controlnet_pipeline.to(self.device)
+
+            # Enable attention slicing to reduce memory usage
+            if hasattr(self.controlnet_pipeline, "enable_attention_slicing"):
+                self.controlnet_pipeline.enable_attention_slicing()
+
+        # Set random seed
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(self.device).manual_seed(seed)
+
+        # Configure scheduler if specified
+        if scheduler is not None:
+            self.controlnet_pipeline.scheduler = scheduler.from_config(
+                self.controlnet_pipeline.scheduler.config
+            )
+
+        # Generate image
+        result = self.controlnet_pipeline(
+            prompt=prompt,
+            image=control_image,
+            negative_prompt=negative_prompt,
+            controlnet_conditioning_scale=conditioning_scale,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            callback=callback,
+            callback_steps=1
+        )
+
+        return result.images
+
+
+class ImageProcessor:
+    """Utility class for image processing operations."""
+
+    @staticmethod
+    def load_image(path):
+        """Load image from path."""
+        from PIL import Image
+        return Image.open(path).convert("RGB")
+
+    @staticmethod
+    def save_image(image, base_filename):
+        """Save image to file with auto-incrementing filename."""
+        import os
+
+        # Create output directory if it doesn't exist
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Create filename with timestamp
+        import time
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"{base_filename}_{timestamp}.png"
+        filepath = os.path.join(output_dir, filename)
+
+        # Make sure file doesn't exist already
+        counter = 1
+        while os.path.exists(filepath):
+            filename = f"{base_filename}_{timestamp}_{counter}.png"
+            filepath = os.path.join(output_dir, filename)
+            counter += 1
+
+        # Save image
+        image.save(filepath)
+        return filepath
+
+    @staticmethod
+    def adjust_image(image, brightness=1.0, contrast=1.0):
+        """Apply brightness and contrast adjustments to image."""
+        from PIL import ImageEnhance
+
+        # Apply brightness
+        if brightness != 1.0:
+            enhancer = ImageEnhance.Brightness(image)
+            image = enhancer.enhance(brightness)
+
+        # Apply contrast
+        if contrast != 1.0:
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(contrast)
+
+        return image
+
+
+class SessionManager:
+    """Manages the image generation session and history."""
+
+    def __init__(self):
+        self.history = []  # List of (image, params) tuples
+        self.current_index = -1
+
+    def add_image(self, image, params):
+        """Add a new image to the history."""
+        # If we're not at the end of history, truncate
+        if self.current_index < len(self.history) - 1:
+            self.history = self.history[:self.current_index + 1]
+
+        # Add new image
+        self.history.append((image, params))
+        self.current_index = len(self.history) - 1
+
+    def get_current_image(self):
+        """Get the current image."""
+        if not self.history:
+            return None
+        return self.history[self.current_index][0]
+
+    def get_current_params(self):
+        """Get the parameters used to generate the current image."""
+        if not self.history:
+            return None
+        return self.history[self.current_index][1]
+
+    def move_to_previous(self):
+        """Move to the previous image in history."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            return True
+        return False
+
+    def move_to_next(self):
+        """Move to the next image in history."""
+        if self.current_index < len(self.history) - 1:
+            self.current_index += 1
+            return True
+        return False
+
+    def save_session(self):
+        """Save the current session to file."""
+        import os
+        import pickle
+        import time
+
+        # Create sessions directory if it doesn't exist
+        session_dir = "sessions"
+        os.makedirs(session_dir, exist_ok=True)
+
+        # Create filename with timestamp
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"session_{timestamp}.pkl"
+        filepath = os.path.join(session_dir, filename)
+
+        # Save session data
+        session_data = {
+            'history': self.history,
+            'current_index': self.current_index
+        }
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(session_data, f)
+
+        return filepath
+
+    def load_session(self):
+        """Load session from file."""
+        import os
+        import pickle
+        import tkinter as tk
+        from tkinter import filedialog
+
+        # Create file dialog
+        root = tk.Tk()
+        root.withdraw()
+
+        # Get session directory
+        session_dir = "sessions"
+        if not os.path.exists(session_dir):
+            os.makedirs(session_dir, exist_ok=True)
+
+        # Open file dialog
+        filepath = filedialog.askopenfilename(
+            initialdir=session_dir,
+            title="Select Session File",
+            filetypes=(("Pickle files", "*.pkl"), ("All files", "*.*"))
+        )
+
+        if not filepath:
+            return False
+
+        # Load session data
+        try:
+            with open(filepath, 'rb') as f:
+                session_data = pickle.load(f)
+
+            self.history = session_data['history']
+            self.current_index = session_data['current_index']
+            return True
+
+        except Exception as e:
+            print(f"Error loading session: {str(e)}")
+            return False
+
+
+# Define available schedulers
+SCHEDULERS = {
+    "DDIM": DDIMScheduler,
+    "DPM++ 2M": DPMSolverMultistepScheduler,
+    "K-LMS": LMSDiscreteScheduler,
+    "PNDM": PNDMScheduler,
+    "Euler A": EulerAncestralDiscreteScheduler,
+    "Euler": EulerDiscreteScheduler
+}
+# Main application class
+class StableDiffusionApp:
+    """Main application class to run the Stable Diffusion UI."""
+    
+    @staticmethod
+    def run():
+        """Initialize and run the Stable Diffusion UI."""
+        # Check for GPU availability
+        if torch.cuda.is_available():
+            print(f"GPU detected: {torch.cuda.get_device_name(0)}")
+            print(f"Available VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            print("No GPU detected. Running on CPU will be very slow.")
+        
+        # Create and display UI
+        ui = StableDiffusionUI()
+        display(ui.main_tab)
+        
+        # Initialize with default model
+        ui.load_model(None)
+
+
+# Entry point for the application
+if __name__ == "__main__":
+    StableDiffusionApp.run()
